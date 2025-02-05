@@ -10,6 +10,7 @@ import os
 
 #TODO: Implement RAG
 knowledge_file = "knowledge_base.xlsx"
+results_file = "results.csv"
 embed_model = SentenceTransformer("all-MiniLM-L6-v2")
 
 def main():
@@ -22,12 +23,12 @@ def main():
     process_scenarios(model, tokenizer, file_path, knowledge_file, output_file)
 
 def load_knowledge_base(file_path: str) -> pd.DataFrame:
-    df = pd.read_excel(file_path, sheet_name=0) 
+    df = pd.read_excel(file_path, sheet_name=0)  
 
+    df[["THREAT ID", "VULNERABILITY ID"]] = df[["THREAT ID", "VULNERABILITY ID"]].ffill()
 
     df["combined_id"] = df["THREAT ID"].astype(str) + "_" + df["VULNERABILITY ID"].astype(str)
 
-    
     df["text"] = df.apply(lambda row: f"THREAT: {row['THREAT']} (ID: {row['THREAT ID']}) - "
                                       f"VULNERABILITY: {row['VULNERABILITY']} (ID: {row['VULNERABILITY ID']}) - "
                                       f"VTHE: {row['VTHE']} - "
@@ -43,15 +44,55 @@ def build_faiss_index(knowledge_base: pd.DataFrame):
     index.add(embeddings)
     return index, embeddings
 
-def retrieve_knowledge(threat_id: str, vuln_id: str, knowledge_base: pd.DataFrame) -> str:
-    combined_id = f"{threat_id}_{vuln_id}"  
-    matches = knowledge_base[knowledge_base["combined_id"] == combined_id]  
+def retrieve_knowledge(risk_id: str, vuln_id: str, knowledge_base: pd.DataFrame):
+    risk_matches = knowledge_base[knowledge_base["THREAT ID"].str.strip() == risk_id.strip()]
+    
+    if risk_matches.empty:
+        print(f"❌ No match found for Risk ID: {risk_id}")
+        return ""
 
-    if not matches.empty:
-        return " ".join(matches["text"].tolist())  
-    return "No relevant knowledge found."
+ 
+    vuln_matches = risk_matches[risk_matches["VULNERABILITY ID"].str.strip() == vuln_id.strip()]
 
-def generate_response(model, tokenizer, input_ids, attention_mask, max_new_tokens=512):
+    if vuln_matches.empty:
+        print(f"❌ No match found for Vulnerability ID: {vuln_id} under Risk ID: {risk_id}")
+        return ""
+
+    vuln_start_index = vuln_matches.index[0]
+    
+    print(f"Vulnerability start index for {vuln_id}: {vuln_start_index}")
+
+    subsequent_rows = knowledge_base.iloc[vuln_start_index + 1:]  
+
+  
+    next_vuln_start_index = None
+    for idx, row in subsequent_rows.iterrows():
+        if pd.notna(row["VULNERABILITY ID"]) and row["VULNERABILITY ID"] != vuln_id:
+            next_vuln_start_index = idx
+            break
+    
+    if next_vuln_start_index is not None:
+        vuln_end_index = next_vuln_start_index - 1  
+        print(f"Next Vulnerability found at index {next_vuln_start_index}, marking range end.")
+    else:
+       
+        vuln_end_index = knowledge_base.index[-1]
+        print(f"No subsequent Vulnerability ID found, using last row index {vuln_end_index}.")
+
+    vuln_range = knowledge_base.iloc[vuln_start_index:vuln_end_index + 1]
+    countermeasures = vuln_range["COUNTERMEASURE"].dropna().tolist()  
+
+    if not countermeasures:
+        print(f"❌ No countermeasures found for {vuln_id} under {risk_id}")
+        return ""
+
+ 
+    print(f"✅ Countermeasures found for {risk_id} - {vuln_id}:")
+
+    return "\n".join([cm.strip() for cm in countermeasures])
+
+
+def generate_response(model, tokenizer, input_ids, attention_mask, max_new_tokens):
     with torch.inference_mode():
         outputs = model.generate(
             input_ids=input_ids,
@@ -68,6 +109,7 @@ def generate_response(model, tokenizer, input_ids, attention_mask, max_new_token
     return response
 
 def process_scenarios(model, tokenizer, input_file, knowledge_file, output_file):
+
     df = pd.read_excel(input_file, sheet_name=" Examples").head(3) 
     history: List[Dict[str, str]] = []
     results = []
@@ -76,7 +118,7 @@ def process_scenarios(model, tokenizer, input_file, knowledge_file, output_file)
     if os.path.exists(knowledge_file):
         knowledge_base = load_knowledge_base(knowledge_file)
     else:
-        print(f"Knowledge base file '{knowledge_file}' not found!")
+        print(f"❌ Knowledge base file '{knowledge_file}' not found!")
         return
 
    
@@ -110,6 +152,7 @@ def process_scenarios(model, tokenizer, input_file, knowledge_file, output_file)
       
         retrieved_knowledge = retrieve_knowledge(assistant_riskID, assistant_vulnid, knowledge_base)
 
+
         input_text = f"""Scenario: {scenario_id},
         User: {scenario_description}, Assistant - Extended: {assistant_long}, Assistant - Short: {assistant_short},
         Assistant - Details {assistant_detail},
@@ -117,9 +160,9 @@ def process_scenarios(model, tokenizer, input_file, knowledge_file, output_file)
         Assistant - Risk description: {assistant_riskdesc},
         Assistant - Vulnerability ID: {assistant_vulnid},
         Assistant - Vulnerability description: {assistant_vulndesc},
-        Assistant - Risk occurenece type: {assistant_riskocc}
+        Assistant - Risk occurence type: {assistant_riskocc}
         Retrieved Knowledge: {retrieved_knowledge}
-        What is the recommended remediation strategy? Explain your reasoning."""
+        What is the recommended remediation strategy? Use the retrieved knowledge to form your answer and select the best ones and mark other as nice to haves rather than mandatory, don't include this input in your answer"""
 
        
         inputs = tokenizer(input_text, padding=True, truncation=True, return_tensors="pt", max_length=512)
@@ -130,16 +173,17 @@ def process_scenarios(model, tokenizer, input_file, knowledge_file, output_file)
         print(f"Given text: {input_text}")
 
         with torch.no_grad():  
-            response = generate_response(model, tokenizer, inputs['input_ids'], inputs['attention_mask'], max_new_tokens=150)
+            response = generate_response(model, tokenizer, inputs['input_ids'], inputs['attention_mask'], max_new_tokens=75)
 
         
         new_knowledge = pd.DataFrame({"combined_id": [f"{assistant_riskID}_{assistant_vulnid}"], "text": [response]})
+        print(f"Answer to the question: {new_knowledge}")
         
         if new_knowledge["text"].values[0] not in knowledge_base["text"].values:
             knowledge_base = pd.concat([knowledge_base, new_knowledge], ignore_index=True)
             knowledge_base.to_excel(knowledge_file, index=False)
 
-    
+
         results.append({
             "Scenario ID": scenario_id,
             "Threat ID": assistant_riskID,
@@ -147,10 +191,10 @@ def process_scenarios(model, tokenizer, input_file, knowledge_file, output_file)
             "Remediation Strategy": response
         })
 
+
     output_df = pd.DataFrame(results)
     output_df.to_csv(output_file, index=False)
     print(f"✅ Results saved to {output_file}")
-    print(f"✅ Knowledge base updated in {knowledge_file}")
 
 
 if __name__ == "__main__":
