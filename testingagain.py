@@ -6,6 +6,7 @@ import faiss
 from sentence_transformers import SentenceTransformer
 from typing import List, Dict
 import os
+import csv
 
 
 #TODO: Implement RAG
@@ -20,10 +21,14 @@ def main():
 #TODO: Need to add your own filepath when using
     file_path = "C:/Users/eetuk/markopoolo/MarkoPoolo/Scenarios.xlsx"
     output_file = "processed_scenarios.csv"
-    process_scenarios(model, tokenizer, file_path, knowledge_file, output_file)
+    knowledge_base = load_knowledge_base(knowledge_file)
+    faiss_index, embeddings = build_faiss_index(knowledge_base)
+
+    process_scenarios(model, tokenizer, file_path, knowledge_file,faiss_index, output_file)
 
 def load_knowledge_base(file_path: str) -> pd.DataFrame:
     df = pd.read_excel(file_path, sheet_name=0)  
+    print("Columns in knowledge base:", df.columns)
 
     df[["THREAT ID", "VULNERABILITY ID"]] = df[["THREAT ID", "VULNERABILITY ID"]].ffill()
 
@@ -44,52 +49,18 @@ def build_faiss_index(knowledge_base: pd.DataFrame):
     index.add(embeddings)
     return index, embeddings
 
-def retrieve_knowledge(risk_id: str, vuln_id: str, knowledge_base: pd.DataFrame):
-    risk_matches = knowledge_base[knowledge_base["THREAT ID"].str.strip() == risk_id.strip()]
-    
-    if risk_matches.empty:
-        print(f"❌ No match found for Risk ID: {risk_id}")
-        return ""
+def retrieve_knowledge_faiss(query_text: str, knowledge_base: pd.DataFrame, faiss_index, top_k=3):
+    """Retrieve the most relevant knowledge using FAISS similarity search"""
+    query_embedding = embed_model.encode([query_text], convert_to_numpy=True)
+    distances, indices = faiss_index.search(query_embedding, top_k)
 
- 
-    vuln_matches = risk_matches[risk_matches["VULNERABILITY ID"].str.strip() == vuln_id.strip()]
+    retrieved_texts = []
+    for idx in indices[0]:
+        if idx < len(knowledge_base):
+            retrieved_texts.append(knowledge_base.iloc[idx]["text"])
 
-    if vuln_matches.empty:
-        print(f"❌ No match found for Vulnerability ID: {vuln_id} under Risk ID: {risk_id}")
-        return ""
+    return "\n".join(retrieved_texts)
 
-    vuln_start_index = vuln_matches.index[0]
-    
-    print(f"Vulnerability start index for {vuln_id}: {vuln_start_index}")
-
-    subsequent_rows = knowledge_base.iloc[vuln_start_index + 1:]  
-
-  
-    next_vuln_start_index = None
-    for idx, row in subsequent_rows.iterrows():
-        if pd.notna(row["VULNERABILITY ID"]) and row["VULNERABILITY ID"] != vuln_id:
-            next_vuln_start_index = idx
-            break
-    
-    if next_vuln_start_index is not None:
-        vuln_end_index = next_vuln_start_index - 1  
-        print(f"Next Vulnerability found at index {next_vuln_start_index}, marking range end.")
-    else:
-       
-        vuln_end_index = knowledge_base.index[-1]
-        print(f"No subsequent Vulnerability ID found, using last row index {vuln_end_index}.")
-
-    vuln_range = knowledge_base.iloc[vuln_start_index:vuln_end_index + 1]
-    countermeasures = vuln_range["COUNTERMEASURE"].dropna().tolist()  
-
-    if not countermeasures:
-        print(f"❌ No countermeasures found for {vuln_id} under {risk_id}")
-        return ""
-
- 
-    print(f"✅ Countermeasures found for {risk_id} - {vuln_id}:")
-
-    return "\n".join([cm.strip() for cm in countermeasures])
 
 
 def generate_response(model, tokenizer, input_ids, attention_mask, max_new_tokens):
@@ -108,10 +79,9 @@ def generate_response(model, tokenizer, input_ids, attention_mask, max_new_token
     response = tokenizer.decode(outputs[0], skip_special_tokens=True)
     return response
 
-def process_scenarios(model, tokenizer, input_file, knowledge_file, output_file):
+def process_scenarios(model, tokenizer, input_file, knowledge_file, faiss_index, output_file):
 
     df = pd.read_excel(input_file, sheet_name=" Examples").head(3) 
-    history: List[Dict[str, str]] = []
     results = []
 
    
@@ -127,8 +97,7 @@ def process_scenarios(model, tokenizer, input_file, knowledge_file, output_file)
     if not knowledge_base.empty:
         embeddings = embedding_model.encode(knowledge_base["combined_id"].tolist(), convert_to_numpy=True)
         index = faiss.IndexFlatL2(embeddings.shape[1])
-        index.add(embeddings)  
-        faiss.write_index(index, "knowledge_index.faiss") 
+        index.add(embeddings) 
     else:
         dummy_embedding = embedding_model.encode(["dummy"])
         index = faiss.IndexFlatL2(dummy_embedding.shape[1])
@@ -149,8 +118,8 @@ def process_scenarios(model, tokenizer, input_file, knowledge_file, output_file)
         assistant_vulndesc = row["Assistant - Vulnerability description"]
         assistant_riskocc = row["Assistant - Risk occurrence type"]
 
-      
-        retrieved_knowledge = retrieve_knowledge(assistant_riskID, assistant_vulnid, knowledge_base)
+        query_text = f"Risk: {assistant_riskdesc}, Vulnerability: {assistant_vulndesc}"
+        retrieved_knowledge = retrieve_knowledge_faiss(query_text, knowledge_base, faiss_index)
 
 
         input_text = f"""Scenario: {scenario_id},
@@ -162,7 +131,7 @@ def process_scenarios(model, tokenizer, input_file, knowledge_file, output_file)
         Assistant - Vulnerability description: {assistant_vulndesc},
         Assistant - Risk occurence type: {assistant_riskocc}
         Retrieved Knowledge: {retrieved_knowledge}
-        What is the recommended remediation strategy? Use the retrieved knowledge to form your answer and select the best ones and mark other as nice to haves rather than mandatory, don't include this input in your answer"""
+        What is the recommended remediation strategy?"""
 
        
         inputs = tokenizer(input_text, padding=True, truncation=True, return_tensors="pt", max_length=512)
@@ -176,26 +145,53 @@ def process_scenarios(model, tokenizer, input_file, knowledge_file, output_file)
             response = generate_response(model, tokenizer, inputs['input_ids'], inputs['attention_mask'], max_new_tokens=75)
 
         
-        new_knowledge = pd.DataFrame({"combined_id": [f"{assistant_riskID}_{assistant_vulnid}"], "text": [response]})
-        print(f"Answer to the question: {new_knowledge}")
+
+        strategies = response.strip()  
+        if "What is the recommended remediation strategy?" in strategies:
+            strategies = strategies.split("What is the recommended remediation strategy?")[-1] 
+        strategies = strategies.strip()
+
+     
+        for strategy in strategies.split("\n"):
+            strategy = strategy.strip()
+            if strategy:  
+                results.append({
+                    "Scenario ID": scenario_id,
+                    "Threat ID": assistant_riskID,
+                    "Vulnerability ID": assistant_vulnid,
+                    "Remediation Strategy": strategy,
+                    "Remediation Type": "Mandatory" if "must" in strategy.lower() else "Nice to Have (NTH)"
+                })
+    
+        save_results_to_csv(results, output_file)
+
+
+def save_results_to_csv(results, output_file):
+    with open(output_file, mode="w", newline="", encoding="utf-8") as file:
+        writer = csv.writer(file)
         
-        if new_knowledge["text"].values[0] not in knowledge_base["text"].values:
-            knowledge_base = pd.concat([knowledge_base, new_knowledge], ignore_index=True)
-            knowledge_base.to_excel(knowledge_file, index=False)
+        writer.writerow([
+            "Scenario ID", "Threat ID", "Vulnerability ID", 
+            "Remediation Strategy", "Remediation Type"
+        ])
 
+        for result in results:
+            writer.writerow([
+                result["Scenario ID"], 
+                result["Threat ID"], 
+                result["Vulnerability ID"], 
+                result["Remediation Strategy"], 
+                result["Remediation Type"]
+            ])
 
-        results.append({
-            "Scenario ID": scenario_id,
-            "Threat ID": assistant_riskID,
-            "Vulnerability ID": assistant_vulnid,
-            "Remediation Strategy": response
-        })
-
-
-    output_df = pd.DataFrame(results)
-    output_df.to_csv(output_file, index=False)
-    print(f"✅ Results saved to {output_file}")
+    print(f"✅ Results properly saved in {output_file}")
 
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
+
