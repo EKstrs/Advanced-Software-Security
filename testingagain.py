@@ -7,16 +7,16 @@ from sentence_transformers import SentenceTransformer
 from typing import List, Dict
 import os
 import csv
+import time
 
 
-#TODO: Implement RAG
 knowledge_file = "knowledge_base.xlsx"
 results_file = "results.csv"
 embed_model = SentenceTransformer("all-MiniLM-L6-v2")
 
 def main():
     torch.cuda.empty_cache()
-    tokenizer = AutoTokenizer.from_pretrained("AIDC-AI/Marco-o1")
+    tokenizer = AutoTokenizer.from_pretrained("AIDC-AI/Marco-o1", padding_side="left")
     model = AutoModelForCausalLM.from_pretrained("AIDC-AI/Marco-o1", device_map="auto", torch_dtype=torch.float16)
 #TODO: Need to add your own filepath when using
     file_path = "C:/Users/eetuk/markopoolo/MarkoPoolo/Scenarios.xlsx"
@@ -63,118 +63,109 @@ def retrieve_knowledge_faiss(query_text: str, knowledge_base: pd.DataFrame, fais
 
 
 
-def generate_response(model, tokenizer, input_ids, attention_mask, max_new_tokens):
-    with torch.inference_mode():
-        outputs = model.generate(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            max_new_tokens=max_new_tokens,
-            do_sample=True,  
-            temperature=0.7,  
-            top_k=50,  
-            top_p=0.9,  
-            pad_token_id=tokenizer.eos_token_id  
-        )
+def generate_response(model, tokenizer, input_ids, attention_mask, max_new_tokens=150):
+    outputs = model.generate(input_ids=input_ids, attention_mask=attention_mask, max_new_tokens=max_new_tokens)
+    responses = [tokenizer.decode(output, skip_special_tokens=True) for output in outputs]
+    return responses  
 
-    response = tokenizer.decode(outputs[0], skip_special_tokens=True)
-    return response
 
-def process_scenarios(model, tokenizer, input_file, knowledge_file, faiss_index, output_file):
-
-    df = pd.read_excel(input_file, sheet_name=" Examples").head(3) 
+def process_scenarios(model, tokenizer, input_file, knowledge_file, faiss_index, output_file, batch_size=5):
+    df = pd.read_excel(input_file, sheet_name=" Examples") 
     results = []
 
-   
-    if os.path.exists(knowledge_file):
-        knowledge_base = load_knowledge_base(knowledge_file)
-    else:
-        print(f"❌ Knowledge base file '{knowledge_file}' not found!")
+    
+    knowledge_base = load_knowledge_base(knowledge_file) if os.path.exists(knowledge_file) else None
+    if knowledge_base is None:
+        print(f"Knowledge base file '{knowledge_file}' not found!")
         return
 
-   
-    embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
+    start_time = time.time()  
 
-    if not knowledge_base.empty:
-        embeddings = embedding_model.encode(knowledge_base["combined_id"].tolist(), convert_to_numpy=True)
-        index = faiss.IndexFlatL2(embeddings.shape[1])
-        index.add(embeddings) 
-    else:
-        dummy_embedding = embedding_model.encode(["dummy"])
-        index = faiss.IndexFlatL2(dummy_embedding.shape[1])
-        print("Initialized FAISS index with dummy embedding.")
+    
+    batch = df.iloc[:batch_size]  
+    batch_texts = []  
 
-    faiss.write_index(index, "knowledge_index.faiss")
-
-   
-    for _, row in df.iterrows():
+    for _, row in batch.iterrows():
         scenario_id = row["Scenario ID"]
         scenario_description = row["User"]
-        assistant_riskID = row["Assistant - Risk ID"]
-        assistant_vulnid = row["Assistant - Vulnerability ID"]
-        assistant_long = row["Assistant - Extended"]
-        assistant_short = row["Assistant - Short"]
-        assistant_detail = row["Assistant - Details"]
         assistant_riskdesc = row["Assistant - Risk description"]
         assistant_vulndesc = row["Assistant - Vulnerability description"]
-        assistant_riskocc = row["Assistant - Risk occurrence type"]
 
+        
         query_text = f"Risk: {assistant_riskdesc}, Vulnerability: {assistant_vulndesc}"
         retrieved_knowledge = retrieve_knowledge_faiss(query_text, knowledge_base, faiss_index)
 
-
-        input_text = f"""Scenario: {scenario_id},
-        User: {scenario_description}, Assistant - Extended: {assistant_long}, Assistant - Short: {assistant_short},
-        Assistant - Details {assistant_detail},
-        Assistant - Risk ID: {assistant_riskID},
-        Assistant - Risk description: {assistant_riskdesc},
-        Assistant - Vulnerability ID: {assistant_vulnid},
-        Assistant - Vulnerability description: {assistant_vulndesc},
-        Assistant - Risk occurence type: {assistant_riskocc}
+        
+        input_text = f"""Scenario ID: {scenario_id},
+        User: {scenario_description},
+        Risk: {assistant_riskdesc},
+        Vulnerability: {assistant_vulndesc},
         Retrieved Knowledge: {retrieved_knowledge}
         What is the recommended remediation strategy?"""
 
-       
-        inputs = tokenizer(input_text, padding=True, truncation=True, return_tensors="pt", max_length=512)
-        inputs = {k: v.to('cuda') for k, v in inputs.items()}  
+        batch_texts.append(input_text)
+        print(f"{input_text}")
+   
+    inputs = tokenizer(batch_texts, padding=True, truncation=True, return_tensors="pt", max_length=512)
+    inputs = {k: v.to('cuda') for k, v in inputs.items()}  # Move to GPU
 
-        
-        print(f'Generating response for Scenario ID: {scenario_id}')
-        print(f"Given text: {input_text}")
+    with torch.no_grad():
+        responses = generate_response(model, tokenizer, inputs['input_ids'], inputs['attention_mask'], max_new_tokens=150)
 
-        with torch.no_grad():  
-            response = generate_response(model, tokenizer, inputs['input_ids'], inputs['attention_mask'], max_new_tokens=75)
+    
+    if isinstance(responses, str):  
+        responses = [responses]  
 
-        
+    elif not isinstance(responses, list):
+        raise TypeError("Expected `generate_response()` to return a list of responses, but got:", type(responses))
 
-        strategies = response.strip()  
-        if "What is the recommended remediation strategy?" in strategies:
-            strategies = strategies.split("What is the recommended remediation strategy?")[-1] 
-        strategies = strategies.strip()
+    num_responses = len(responses)
+    num_scenarios = len(batch)
 
-     
-        for strategy in strategies.split("\n"):
+    if num_responses != num_scenarios:
+        print(f"Warning: Expected {num_scenarios} responses but got {num_responses}. Check the LRM output.")
+    print(f"Generated {len(responses)} responses:", responses)
+
+
+    for idx in range(min(num_responses, num_scenarios)):  
+        scenario_id = batch.iloc[idx]["Scenario ID"]
+        threat_id = batch.iloc[idx]["Assistant - Risk ID"]
+        vuln_id = batch.iloc[idx]["Assistant - Vulnerability ID"]
+
+        strategies = responses[idx].strip().split("\n")  
+
+        for strategy in strategies:
             strategy = strategy.strip()
-            if strategy:  
+            if strategy:
                 results.append({
                     "Scenario ID": scenario_id,
-                    "Threat ID": assistant_riskID,
-                    "Vulnerability ID": assistant_vulnid,
+                    "Threat ID": threat_id,
+                    "Vulnerability ID": vuln_id,
                     "Remediation Strategy": strategy,
                     "Remediation Type": "Mandatory" if "must" in strategy.lower() else "Nice to Have (NTH)"
                 })
-    
-        save_results_to_csv(results, output_file)
+
+    end_time = time.time()  
+    print(f"Batch of {batch_size} scenarios took {end_time - start_time:.2f} seconds.")
+
+  
+    save_results_to_csv(results, output_file)
+
+    print("First batch processed. Stopping execution for testing.")
+
 
 
 def save_results_to_csv(results, output_file):
     with open(output_file, mode="w", newline="", encoding="utf-8") as file:
         writer = csv.writer(file)
         
+ 
         writer.writerow([
             "Scenario ID", "Threat ID", "Vulnerability ID", 
             "Remediation Strategy", "Remediation Type"
         ])
 
+        
         for result in results:
             writer.writerow([
                 result["Scenario ID"], 
@@ -189,9 +180,3 @@ def save_results_to_csv(results, output_file):
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
-
