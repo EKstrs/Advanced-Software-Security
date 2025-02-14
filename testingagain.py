@@ -10,6 +10,7 @@ import csv
 import time
 
 
+
 knowledge_file = "knowledge_base.xlsx"
 results_file = "results.csv"
 embed_model = SentenceTransformer("all-MiniLM-L6-v2")
@@ -28,7 +29,6 @@ def main():
 
 def load_knowledge_base(file_path: str) -> pd.DataFrame:
     df = pd.read_excel(file_path, sheet_name=0)  
-    print("Columns in knowledge base:", df.columns)
 
     df[["THREAT ID", "VULNERABILITY ID"]] = df[["THREAT ID", "VULNERABILITY ID"]].ffill()
 
@@ -49,6 +49,8 @@ def build_faiss_index(knowledge_base: pd.DataFrame):
     index.add(embeddings)
     return index, embeddings
 
+
+
 def retrieve_knowledge_faiss(query_text: str, knowledge_base: pd.DataFrame, faiss_index, top_k=3):
     """Retrieve the most relevant knowledge using FAISS similarity search"""
     query_embedding = embed_model.encode([query_text], convert_to_numpy=True)
@@ -63,13 +65,19 @@ def retrieve_knowledge_faiss(query_text: str, knowledge_base: pd.DataFrame, fais
 
 
 
-def generate_response(model, tokenizer, input_ids, attention_mask, max_new_tokens=150):
-    outputs = model.generate(input_ids=input_ids, attention_mask=attention_mask, max_new_tokens=max_new_tokens)
-    responses = [tokenizer.decode(output, skip_special_tokens=True) for output in outputs]
-    return responses  
+
+def generate_response(model, tokenizer, input_ids, attention_mask, max_tokens_per_scenario=256):
+    responses = model.generate(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        max_new_tokens=max_tokens_per_scenario
+    )
+
+    return [tokenizer.decode(output, skip_special_tokens=True) for output in responses]
 
 
-def process_scenarios(model, tokenizer, input_file, knowledge_file, faiss_index, output_file, batch_size=5):
+
+def process_scenarios(model, tokenizer, input_file, knowledge_file, faiss_index, output_file, batch_size=10):
     df = pd.read_excel(input_file, sheet_name=" Examples") 
     results = []
 
@@ -88,29 +96,33 @@ def process_scenarios(model, tokenizer, input_file, knowledge_file, faiss_index,
     for _, row in batch.iterrows():
         scenario_id = row["Scenario ID"]
         scenario_description = row["User"]
+        risk_id = row["Assistant - Risk ID"]
+        vuln_id = row["Assistant - Vulnerability ID"]
         assistant_riskdesc = row["Assistant - Risk description"]
         assistant_vulndesc = row["Assistant - Vulnerability description"]
+        occurence = row["Assistant - Risk occurrence type"]
 
         
-        query_text = f"Risk: {assistant_riskdesc}, Vulnerability: {assistant_vulndesc}"
+        query_text = f"THREAT ID: {risk_id}, {assistant_riskdesc} due to VULNERABILITY ID: {vuln_id}, {assistant_vulndesc}. What are the best mitigation measures?"
+        print(f"Query text for FAISS: {query_text}")
         retrieved_knowledge = retrieve_knowledge_faiss(query_text, knowledge_base, faiss_index)
 
         
         input_text = f"""Scenario ID: {scenario_id},
         User: {scenario_description},
-        Risk: {assistant_riskdesc},
-        Vulnerability: {assistant_vulndesc},
+        Risk: {risk_id} {assistant_riskdesc},
+        Vulnerability: {vuln_id} {assistant_vulndesc},
         Retrieved Knowledge: {retrieved_knowledge}
         What is the recommended remediation strategy?"""
 
         batch_texts.append(input_text)
-        print(f"{input_text}")
+        print(f"Full input text: {input_text}\n")
    
-    inputs = tokenizer(batch_texts, padding=True, truncation=True, return_tensors="pt", max_length=512)
+    inputs = tokenizer(batch_texts, padding=True, truncation=True, return_tensors="pt", max_length=2048)
     inputs = {k: v.to('cuda') for k, v in inputs.items()}  # Move to GPU
 
     with torch.no_grad():
-        responses = generate_response(model, tokenizer, inputs['input_ids'], inputs['attention_mask'], max_new_tokens=150)
+        responses = generate_response(model, tokenizer, inputs['input_ids'], inputs['attention_mask'], max_tokens_per_scenario=256)
 
     
     if isinstance(responses, str):  
@@ -131,19 +143,32 @@ def process_scenarios(model, tokenizer, input_file, knowledge_file, faiss_index,
         scenario_id = batch.iloc[idx]["Scenario ID"]
         threat_id = batch.iloc[idx]["Assistant - Risk ID"]
         vuln_id = batch.iloc[idx]["Assistant - Vulnerability ID"]
+        occurence = batch.iloc[idx]["Assistant - Risk occurrence type"]
+        print(f"{occurence}")
 
-        strategies = responses[idx].strip().split("\n")  
+        output_text = responses[idx]  
+
+        # Remove the original input text if it appears in the response
+        cleaned_response = output_text.replace(batch_texts[idx], "").strip()  
+
+        strategies = cleaned_response.split("\n")  
 
         for strategy in strategies:
             strategy = strategy.strip()
             if strategy:
+                mandatory_keywords = ["Real"]
+                # Convert to string and check for mandatory keywords
+                occurence_str = str(occurence) if not pd.isna(occurence) else ""
+
+                is_mandatory = any(keyword in occurence_str for keyword in mandatory_keywords)
+
                 results.append({
                     "Scenario ID": scenario_id,
                     "Threat ID": threat_id,
                     "Vulnerability ID": vuln_id,
                     "Remediation Strategy": strategy,
-                    "Remediation Type": "Mandatory" if "must" in strategy.lower() else "Nice to Have (NTH)"
-                })
+                    "Remediation Type": "Mandatory" if is_mandatory else "Nice to Have (NTH)"
+            })
 
     end_time = time.time()  
     print(f"Batch of {batch_size} scenarios took {end_time - start_time:.2f} seconds.")
@@ -159,13 +184,13 @@ def save_results_to_csv(results, output_file):
     with open(output_file, mode="w", newline="", encoding="utf-8") as file:
         writer = csv.writer(file)
         
- 
+        # Write headers
         writer.writerow([
             "Scenario ID", "Threat ID", "Vulnerability ID", 
             "Remediation Strategy", "Remediation Type"
         ])
 
-        
+        # Write each result in a row
         for result in results:
             writer.writerow([
                 result["Scenario ID"], 
