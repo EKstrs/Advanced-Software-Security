@@ -24,14 +24,17 @@ python main.py
 ```
 
 ### Input Data
-- **Knowledge Base**: `knowledge_base.xlsx`
-- **Scenario Data**: `Scenarios.xlsx`
-
-Modify the file paths in `main()` if necessary:
+When initialized, the ReEval class reads input data from config.json
+When running first time, the program creates `config.json` template to your working directory, to avoid this you can add file `config.json` yourself with following data:
 ```python
-knowledge_file = "path/to/knowledge_base.xlsx"
-file_path = "path/to/Scenarios.xlsx"
+{
+    "input_file": "C:\\path\\to\\Scenarios.xlsx",
+    "knowledge_file": "knowledge_base.xlsx",
+    "output_file": "processed_scenarios.csv",
+    "max_tokens_per_scenario": 128
+}
 ```
+To max_tokens_per_scenario please use preferred value
 
 ### Output
 The script generates `processed_scenarios.csv`, which includes:
