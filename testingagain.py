@@ -20,7 +20,7 @@ bnb_config = BitsAndBytesConfig(
 # Load tokenizer
 tokenizer = AutoTokenizer.from_pretrained("AIDC-AI/Marco-o1", padding_side="left")
 
-# Load model WITHOUT `.to(device)` because bitsandbytes handles it
+
 model = AutoModelForCausalLM.from_pretrained(
     "AIDC-AI/Marco-o1", 
     quantization_config=bnb_config  # 8-bit quantization enabled
@@ -61,7 +61,7 @@ def load_knowledge_base(file_path: str) -> pd.DataFrame:
 def build_faiss_index(knowledge_base: pd.DataFrame):
     """Build FAISS index using manually computed embeddings."""
     texts = knowledge_base["text"].tolist()
-    embeddings = np.vstack([get_embedding(text) for text in texts])  # Stack embeddings
+    embeddings = np.vstack([get_embedding(text) for text in texts]) 
     index = faiss.IndexFlatL2(embeddings.shape[1])
     index.add(embeddings)
     return index, embeddings
@@ -80,7 +80,7 @@ def generate_response(model, tokenizer, input_ids, attention_mask):
     """Dynamically adjust max_new_tokens based on input length."""
     
     input_length = input_ids.shape[1]  # Get input sequence length
-    max_model_length = 4096  # Change this based on your model's limit
+    max_model_length = 4096  
 
     max_new_tokens = min(1024, max_model_length - input_length)  # Prevent overflow
 
