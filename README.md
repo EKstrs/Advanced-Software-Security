@@ -1,5 +1,7 @@
 # Advanced-Software-Security
 
+**Video Explanation: https://www.youtube.com/watch?v=yROLDTA8hkQ**
+
 ## Installation
 ### Prerequisites
 Ensure you have the following installed:
