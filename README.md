@@ -10,12 +10,13 @@ Ensure you have the following installed:
 - `transformers`
 - `pandas`
 - `faiss-cpu`
-- `sentence-transformers`
+- `faiss-gpu`
+- `numpy`
 - `openpyxl`
 
 Install dependencies using:
 ```sh
-pip install torch transformers pandas faiss-cpu sentence-transformers openpyxl
+pip install torch transformers pandas faiss-cpu numpy openpyxl
 ```
 
 ## Usage
@@ -29,10 +30,10 @@ python main.py
 - **Knowledge Base**: `knowledge_base.xlsx`
 - **Scenario Data**: `Scenarios.xlsx`
 
-Modify the file paths in `main()` if necessary:
+Modify the file paths under the `#Paths` comment if necessary:
 ```python
 knowledge_file = "path/to/knowledge_base.xlsx"
-file_path = "path/to/Scenarios.xlsx"
+scenarios_file = "path/to/Scenarios.xlsx"
 ```
 
 ### Output
