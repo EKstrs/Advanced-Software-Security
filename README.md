@@ -16,7 +16,7 @@ Ensure you have the following installed:
 
 Install dependencies using:
 ```sh
-pip install torch transformers pandas faiss-cpu numpy openpyxl
+pip install torch transformers pandas faiss-cpu faiss-gpu numpy openpyxl
 ```
 
 ## Usage
